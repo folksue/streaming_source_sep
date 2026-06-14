@@ -19,6 +19,7 @@ npm run download:duration
 - Downloads tracks concurrently.
 - Skips duplicate track IDs using a state file.
 - Saves tracks into per-style folders under the output directory.
+- Rescans the output directory on startup so you can stop and restart without losing progress.
 
 ## Main settings
 
@@ -33,6 +34,7 @@ Edit these defaults near the top of `scripts/batch_download_by_duration.cjs`:
 - `DOWNLOAD_CONCURRENCY`: concurrent file downloads
 - `STYLE_CONCURRENCY`: concurrent styles processed at once
 - `API_RETRIES`: retry count for NetEase API calls
+- `RESCAN_ON_START`: rescan the output directory and rebuild progress from existing files
 
 You can also override the most important ones from the CLI:
 
@@ -61,6 +63,7 @@ Use the minimal cookie fields needed for login and high-quality requests, typica
 - `lossless` and higher levels can produce real `.flac` files for some tracks.
 - Some tracks still resolve to `.mp3`, depending on availability and rights.
 - The script does not force-convert formats. It saves whatever the source URL returns.
+- On restart, it counts the existing files under each style folder and resumes from that total.
 
 ## Notes
 

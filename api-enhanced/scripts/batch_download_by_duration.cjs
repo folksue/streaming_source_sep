@@ -25,6 +25,7 @@ const CONFIG = {
   MAX_EMPTY_STYLE_ROUNDS: 8,
   API_RETRIES: 3,
   API_RETRY_DELAY_MS: 1500,
+  RESCAN_ON_START: true,
 
   // Leave empty to use all NetEase playlist tags under the "风格" category.
   STYLE_NAMES: [],
@@ -56,6 +57,8 @@ const FALLBACK_STYLES = [
   '后摇',
   'Bossa Nova',
 ]
+
+let musicMetadataModulePromise = null
 
 function parseArgs(argv) {
   const args = {}
@@ -114,6 +117,93 @@ function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true })
 }
 
+function isAudioFile(filePath) {
+  return /\.(flac|mp3|wav|m4a|aac|ogg)$/i.test(filePath)
+}
+
+function parseTrackIdFromFilename(fileName) {
+  const match = String(fileName).match(/^(\d+)\s+-\s+/)
+  return match ? match[1] : ''
+}
+
+async function readAudioFileMetadata(filePath) {
+  try {
+    if (!musicMetadataModulePromise) {
+      musicMetadataModulePromise = import('music-metadata')
+    }
+    const mm = await musicMetadataModulePromise
+    const metadata = await mm.parseFile(filePath, { duration: true })
+    return {
+      durationMs: Math.max(0, Math.round((metadata.format.duration || 0) * 1000)),
+      format: String(metadata.format.container || path.extname(filePath).slice(1) || 'unknown').toLowerCase(),
+    }
+  } catch {
+    return {
+      durationMs: 0,
+      format: String(path.extname(filePath).slice(1) || 'unknown').toLowerCase(),
+    }
+  }
+}
+
+async function scanExistingDownloads(outputDir) {
+  if (!fs.existsSync(outputDir)) {
+    return {
+      files: [],
+      totalDurationMs: 0,
+      downloadedIds: [],
+      byStyle: {},
+      byFormat: {},
+    }
+  }
+
+  const entries = await fs.promises.readdir(outputDir, { withFileTypes: true })
+  const files = []
+  let totalDurationMs = 0
+  const downloadedIds = []
+  const byStyle = {}
+  const byFormat = {}
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const style = entry.name
+    const styleDir = path.join(outputDir, style)
+    const styleFiles = await fs.promises.readdir(styleDir, { withFileTypes: true })
+
+    for (const styleFile of styleFiles) {
+      if (!styleFile.isFile()) continue
+      const filePath = path.join(styleDir, styleFile.name)
+      if (!isAudioFile(filePath)) continue
+
+      const id = parseTrackIdFromFilename(styleFile.name)
+      const { durationMs, format } = await readAudioFileMetadata(filePath)
+      const artistsAndName = styleFile.name.replace(/^(\d+)\s+-\s+/, '').replace(/\.[^.]+$/, '')
+
+      files.push({
+        id,
+        name: artistsAndName,
+        artists: [],
+        style,
+        durationMs,
+        file: filePath,
+        downloadedAt: null,
+        format,
+      })
+      if (id) downloadedIds.push(id)
+      totalDurationMs += durationMs
+      byStyle[style] = (byStyle[style] || 0) + 1
+      byFormat[format] = (byFormat[format] || 0) + 1
+    }
+  }
+
+  return {
+    files,
+    totalDurationMs,
+    downloadedIds,
+    byStyle,
+    byFormat,
+  }
+}
+
 function loadState(file) {
   if (!fs.existsSync(file)) {
     return {
@@ -132,6 +222,36 @@ function loadState(file) {
     totalDurationMs: state.totalDurationMs || 0,
     files: state.files || [],
     styleOffsets: state.styleOffsets || {},
+  }
+}
+
+function mergeDiskState(loadedState, diskState) {
+  const fileMap = new Map()
+  for (const file of loadedState.files || []) {
+    if (file?.id) fileMap.set(String(file.id), file)
+  }
+  for (const file of diskState.files || []) {
+    if (file?.id) fileMap.set(String(file.id), file)
+  }
+
+  const downloadedIds = Array.from(
+    new Set([...(loadedState.downloadedIds || []), ...(diskState.downloadedIds || [])].map(String)),
+  )
+  const failedIds = loadedState.failedIds || {}
+  const styleOffsets = loadedState.styleOffsets || {}
+
+  const mergedFiles = Array.from(fileMap.values())
+  const totalDurationMs = mergedFiles.reduce(
+    (sum, file) => sum + (Number(file.durationMs) || 0),
+    0,
+  )
+
+  return {
+    downloadedIds,
+    failedIds,
+    totalDurationMs,
+    files: mergedFiles,
+    styleOffsets,
   }
 }
 
@@ -485,7 +605,17 @@ async function main() {
   ensureDir(config.OUTPUT_DIR)
   ensureDir(path.dirname(config.STATE_FILE))
 
-  const state = loadState(config.STATE_FILE)
+  const loadedState = loadState(config.STATE_FILE)
+  const diskState = config.RESCAN_ON_START
+    ? await scanExistingDownloads(config.OUTPUT_DIR)
+    : {
+        files: [],
+        totalDurationMs: 0,
+        downloadedIds: [],
+        byStyle: {},
+        byFormat: {},
+      }
+  const state = mergeDiskState(loadedState, diskState)
   const styles = shuffle(await getStyles(config))
   const perStyleTargetMs = Math.ceil(targetMs / styles.length)
   const styleDurations = getStyleDurations(state)
@@ -498,6 +628,10 @@ async function main() {
   console.log(`Per-style target: ${formatDuration(perStyleTargetMs)}`)
   console.log(`Style concurrency: ${config.STYLE_CONCURRENCY}`)
   console.log(`Already downloaded: ${state.downloadedIds.length}, ${formatDuration(state.totalDurationMs)}`)
+  if (config.RESCAN_ON_START) {
+    console.log(`Disk styles: ${JSON.stringify(diskState.byStyle)}`)
+    console.log(`Disk formats: ${JSON.stringify(diskState.byFormat)}`)
+  }
 
   await runLimited(styles, config.STYLE_CONCURRENCY, (style) =>
     processStyle(style, {
@@ -516,7 +650,15 @@ async function main() {
   console.log(`Output: ${config.OUTPUT_DIR}`)
 }
 
-main().catch((error) => {
-  console.error(error)
-  process.exitCode = 1
-})
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })
+}
+
+module.exports = {
+  main,
+  scanExistingDownloads,
+  mergeDiskState,
+}
